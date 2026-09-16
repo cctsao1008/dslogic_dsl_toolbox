@@ -12,6 +12,10 @@ Timing markers are independently configurable:
 
 PWM display units are independently configurable:
   --pwm-axis us|percent
+
+RPM handling is intentionally split:
+  - target-time detection uses valid, unsmoothed RPM samples
+  - the plotted RPM curve may use a median filter
 """
 
 import argparse
@@ -21,14 +25,14 @@ from pathlib import Path
 
 from dslogic_dsl_toolbox import DSL, DSLError, pulse_iter, span
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 RPM_CH = "CH0"
 COMMAND_CH = "CH1"
 
 
 def median_filter(rows, window):
     if window <= 1:
-        return rows
+        return list(rows)
     if window % 2 == 0:
         window += 1
     half = window // 2
@@ -118,6 +122,7 @@ def choose_throttle_t(s, pulses, a):
 
 
 def decode_rpm(s, a):
+    """Return valid, unsmoothed mechanical-RPM samples plus quality metadata."""
     if a.ppr <= 0:
         raise DSLError("--ppr must be > 0")
     if not (0 <= a.quality_reject_ratio <= 1):
@@ -188,7 +193,7 @@ def decode_rpm(s, a):
         "rejected_sanity": sanity_reject,
         "rejected_ratio": reject_ratio,
     }
-    return (idx, name), median_filter(rows, a.rpm_median_window), quality
+    return (idx, name), rows, quality
 
 
 def sustained_target_cross(rows, start_s, end_s, target, hold_s, min_samples):
@@ -208,7 +213,8 @@ def sustained_target_cross(rows, start_s, end_s, target, hold_s, min_samples):
     return None
 
 
-def choose_rpm_t(s, rows, throttle_t, a):
+def choose_rpm_t(s, raw_rpm_rows, throttle_t, a):
+    """Choose target RPM time from valid, unsmoothed RPM samples."""
     if a.rpm_t == "none":
         return None
     if a.rpm_t == "manual":
@@ -221,7 +227,7 @@ def choose_rpm_t(s, rows, throttle_t, a):
     start = throttle_t if throttle_t is not None else (a.start_s or 0.0)
     end = min(s.duration, a.end_s or s.duration)
     return sustained_target_cross(
-        rows, start, end, a.target_rpm,
+        raw_rpm_rows, start, end, a.target_rpm,
         a.target_hold_ms * 1e-3, a.target_min_samples,
     )
 
@@ -243,7 +249,7 @@ def build_pwm_plot_rows(pwm_rows, start_s, end_s, origin, a):
     return [t - origin for t, _ in q], [pwm_display_value(w, a) for _, w in q]
 
 
-def plot(s, capture_name, rpm_rows, pwm_rows, throttle_t, rpm_t, step, a):
+def plot(s, capture_name, raw_rpm_rows, plot_rpm_rows, pwm_rows, throttle_t, rpm_t, step, a):
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -264,7 +270,7 @@ def plot(s, capture_name, rpm_rows, pwm_rows, throttle_t, rpm_t, step, a):
         plot_end = min(s.duration, a.end_s or s.duration)
         xlabel = "Capture time (s)"
 
-    r = [(t - origin, rpm) for t, rpm, *_ in rpm_rows if plot_start <= t <= plot_end]
+    r = [(t - origin, rpm) for t, rpm, *_ in plot_rpm_rows if plot_start <= t <= plot_end]
     if not r:
         raise DSLError("No RPM samples in selected plot window")
     px, py = build_pwm_plot_rows(pwm_rows, plot_start, plot_end, origin, a)
@@ -283,8 +289,13 @@ def plot(s, capture_name, rpm_rows, pwm_rows, throttle_t, rpm_t, step, a):
     elapsed = None
     if rpm_t is not None:
         rpm_t_x = rpm_t - origin
-        nearest = min(rpm_rows, key=lambda row: abs(row[0] - rpm_t))
-        marker_rpm = nearest[1]
+
+        if a.rpm_t == "auto":
+            marker_rpm = a.target_rpm
+        else:
+            nearest_raw = min(raw_rpm_rows, key=lambda row: abs(row[0] - rpm_t))
+            marker_rpm = nearest_raw[1]
+
         ax1.scatter([rpm_t_x], [marker_rpm], s=45, zorder=5)
         if throttle_t is not None:
             elapsed = rpm_t - throttle_t
@@ -386,9 +397,12 @@ def parser():
 
     p.add_argument("--target-hold-ms", type=float, default=100.0)
     p.add_argument("--target-min-samples", type=int, default=3)
-    p.add_argument("--min-edge-spacing-ms", type=float, default=0.0)
-    p.add_argument("--rpm-sanity-max", type=float, default=0.0)
-    p.add_argument("--rpm-median-window", type=int, default=5)
+    p.add_argument("--min-edge-spacing-ms", type=float, default=0.0,
+                   help="reject raw selected-edge intervals shorter than this; 0 disables")
+    p.add_argument("--rpm-sanity-max", type=float, default=0.0,
+                   help="reject derived RPM above this limit; 0 disables")
+    p.add_argument("--rpm-median-window", type=int, default=3,
+                   help="median-filter window for plotted RPM only; target-time detection remains unsmoothed")
     p.add_argument("--quality-reject-ratio", type=float, default=0.99)
     p.add_argument("--min-valid-rpm-samples", type=int, default=3)
     p.add_argument("--allow-low-quality-rpm", action="store_true")
@@ -410,11 +424,18 @@ def main():
     try:
         if a.pwm_axis == "percent" and a.pwm_high_us == a.pwm_low_us:
             raise DSLError("--pwm-high-us and --pwm-low-us must differ in percent mode")
+        if a.rpm_median_window < 1:
+            raise DSLError("--rpm-median-window must be >= 1")
+
         with DSL(a.dsl) as s:
             _cmd, pulses, pwm_rows = decode_pwm(s, a)
             throttle_t, step, _segments = choose_throttle_t(s, pulses, a)
-            _rpm, rpm_rows, quality = decode_rpm(s, a)
-            rpm_t = choose_rpm_t(s, rpm_rows, throttle_t, a)
+
+            _rpm, raw_rpm_rows, quality = decode_rpm(s, a)
+            plot_rpm_rows = median_filter(raw_rpm_rows, a.rpm_median_window)
+
+            # IMPORTANT: RPM target timing is measured from valid unsmoothed samples.
+            rpm_t = choose_rpm_t(s, raw_rpm_rows, throttle_t, a)
 
             if quality["checked"]:
                 print(
@@ -426,7 +447,18 @@ def main():
                     "RPM quality: UNCHECKED | no plausibility limits active "
                     "(--min-edge-spacing-ms=0 and --rpm-sanity-max=0)"
                 )
-            plot(s, Path(a.dsl).name, rpm_rows, pwm_rows, throttle_t, rpm_t, step, a)
+            print("RPM timing source: raw valid samples (unsmoothed)")
+            if a.rpm_median_window <= 1:
+                print("RPM plot filter: none")
+            else:
+                effective_window = a.rpm_median_window if a.rpm_median_window % 2 else a.rpm_median_window + 1
+                print(f"RPM plot filter: median window={effective_window}")
+
+            plot(
+                s, Path(a.dsl).name,
+                raw_rpm_rows, plot_rpm_rows, pwm_rows,
+                throttle_t, rpm_t, step, a,
+            )
         return 0
     except (DSLError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
