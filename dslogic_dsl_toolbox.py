@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Read-only toolbox for ZIP-based, non-RLE DSView/DSLogic .dsl captures."""
+
 import argparse
 import configparser
 import csv
@@ -12,7 +13,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 class DSLError(RuntimeError):
@@ -111,14 +112,14 @@ class DSL:
 
     def data(self, idx):
         if idx not in self.cache:
-            a = []
+            blocks = []
             for n in self.z.namelist():
                 m = re.fullmatch(rf"L-{idx}/(\d+)", n)
                 if m:
-                    a.append((int(m.group(1)), n))
-            if not a:
+                    blocks.append((int(m.group(1)), n))
+            if not blocks:
                 raise DSLError(f"No data for CH{idx}")
-            self.cache[idx] = b"".join(self.z.read(n) for _, n in sorted(a))
+            self.cache[idx] = b"".join(self.z.read(n) for _, n in sorted(blocks))
         return self.cache[idx]
 
     def bit(self, idx, n):
@@ -278,6 +279,10 @@ def rpm(a):
         raise DSLError("--ppr must be > 0")
     if a.min_edge_spacing_ms < 0 or a.rpm_sanity_max < 0:
         raise DSLError("RPM filter values must be >= 0")
+    if not (0.0 <= a.quality_reject_ratio <= 1.0):
+        raise DSLError("--quality-reject-ratio must be between 0 and 1")
+    if a.min_valid_samples < 1:
+        raise DSLError("--min-valid-samples must be >= 1")
 
     with DSL(a.dsl) as s:
         i, name = s.resolve(a.channel)
@@ -300,7 +305,7 @@ def rpm(a):
                 prev = n
                 continue
             dt = (n - prev) / s.hz
-            prev = n  # always use adjacent raw selected edges; never merge rejected intervals
+            prev = n  # use adjacent raw selected edges; never merge rejected intervals
             if dt <= 0:
                 continue
             if min_dt > 0 and dt < min_dt:
@@ -314,10 +319,9 @@ def rpm(a):
             rows.append((n, dt, freq, value))
             values.append(value)
 
-        if not rows:
-            raise DSLError(
-                "No valid RPM samples. Check channel/edge/PPR and --min-edge-spacing-ms/--rpm-sanity-max."
-            )
+        considered = len(rows) + short_reject + sanity_reject
+        rejected = short_reject + sanity_reject
+        reject_ratio = rejected / considered if considered else 1.0
 
         print(f"Channel                : CH{i} ({name})")
         print(f"Edge mode              : {a.edge}")
@@ -326,8 +330,31 @@ def rpm(a):
         print(f"Valid RPM samples      : {len(rows):,}")
         print(f"Rejected short interval: {short_reject:,}")
         print(f"Rejected sanity max    : {sanity_reject:,}")
-        print(f"RPM median             : {statistics.median(values):.3f}")
-        print(f"RPM min/max            : {min(values):.3f} / {max(values):.3f}")
+        print(f"Rejected interval ratio: {100.0 * reject_ratio:.4f} %")
+        if values:
+            print(f"RPM median             : {statistics.median(values):.3f}")
+            print(f"RPM min/max            : {min(values):.3f} / {max(values):.3f}")
+
+        quality_bad = len(rows) < a.min_valid_samples or (
+            considered >= a.min_valid_samples and reject_ratio >= a.quality_reject_ratio
+        )
+        if quality_bad:
+            msg = (
+                "RPM signal quality check failed: the selected channel/edge/PPR model produced too few valid "
+                "samples or rejected almost all intervals. Check channel mapping, sensor output, edge polarity, "
+                "PPR, and filtering limits. Use --allow-low-quality only to inspect/debug suspect data."
+            )
+            if not a.allow_low_quality:
+                raise DSLError(msg)
+            print(f"WARNING: {msg}", file=sys.stderr)
+        elif a.min_edge_spacing_ms == 0 and a.rpm_sanity_max == 0:
+            print(
+                "NOTE: No RPM quality limits are active; signal-model compatibility is not being sanity-checked.",
+                file=sys.stderr,
+            )
+
+        if not rows:
+            raise DSLError("No valid RPM samples")
 
         if a.output:
             with open(a.output, "w", newline="", encoding="utf-8") as f:
@@ -431,6 +458,72 @@ def pwm(a):
             print(f"Wrote: {a.output}")
 
 
+def _plot_waveform(plt, s, cs, st, en, a):
+    fig, ax = plt.subplots(figsize=(12, max(3.5, 1.2 + 0.8 * len(cs))))
+    yt, labels = [], []
+    for row, (i, name) in enumerate(cs):
+        cur = s.bit(i, st)
+        tr = list(s.rows(i, max(1, st + 1), en))
+        if len(tr) > a.max_transitions:
+            raise DSLError(
+                f"CH{i} has {len(tr):,} transitions; narrow the time window, increase --max-transitions, "
+                "or use --plot-mode overview"
+            )
+        xs = [st / s.hz]
+        ys = [row * 2 + cur]
+        for n, new in tr:
+            x = n / s.hz
+            xs.extend([x, x])
+            ys.extend([row * 2 + cur, row * 2 + new])
+            cur = new
+        xs.append(en / s.hz)
+        ys.append(row * 2 + cur)
+        ax.plot(xs, ys, linewidth=1.0)
+        yt.append(row * 2 + 0.5)
+        labels.append(f"CH{i} ({name})")
+    ax.set_xlabel("Time (s)")
+    ax.set_yticks(yt, labels)
+    ax.set_xlim(st / s.hz, en / s.hz)
+    ax.grid(True, axis="x", alpha=0.25)
+    return fig
+
+
+def _plot_overview(plt, s, cs, st, en, a):
+    bins = a.overview_bins
+    if bins < 10:
+        raise DSLError("--overview-bins must be >= 10")
+    width_samples = max(1, math.ceil((en - st) / bins))
+    actual_bins = math.ceil((en - st) / width_samples)
+    bin_seconds = width_samples / s.hz
+    centers = [
+        (st + min((k + 0.5) * width_samples, en - st)) / s.hz
+        for k in range(actual_bins)
+    ]
+
+    fig, axes = plt.subplots(
+        len(cs), 1, figsize=(12, max(3.2, 2.4 * len(cs))), sharex=True, squeeze=False
+    )
+    axes = [r[0] for r in axes]
+    for ax, (i, name) in zip(axes, cs):
+        counts = [0] * actual_bins
+        for n in s.transitions(i, max(1, st + 1), en):
+            k = min((n - st) // width_samples, actual_bins - 1)
+            counts[k] += 1
+        rates = [c / bin_seconds for c in counts]
+        ax.plot(centers, rates, linewidth=1.0)
+        ax.set_ylabel(f"CH{i} ({name})\nedges/s")
+        ax.grid(True, axis="x", alpha=0.25)
+        if a.overview_log_y:
+            ax.set_yscale("symlog", linthresh=1.0)
+    axes[-1].set_xlabel("Time (s)")
+    axes[-1].set_xlim(st / s.hz, en / s.hz)
+    fig.suptitle(
+        f"Transition-rate overview ({actual_bins} bins, {bin_seconds*1000:.3f} ms/bin)",
+        fontsize=11,
+    )
+    return fig
+
+
 def plot(a):
     try:
         import matplotlib.pyplot as plt
@@ -440,29 +533,10 @@ def plot(a):
     with DSL(a.dsl) as s:
         cs = chans(s, a.channels)
         st, en = span(s, a.start_s, a.end_s)
-        fig, ax = plt.subplots(figsize=(12, max(3.5, 1.2 + 0.8 * len(cs))))
-        yt, labels = [], []
-        for row, (i, name) in enumerate(cs):
-            cur = s.bit(i, st)
-            tr = list(s.rows(i, max(1, st + 1), en))
-            if len(tr) > a.max_transitions:
-                raise DSLError(f"CH{i} has {len(tr):,} transitions; narrow the time window")
-            xs = [st / s.hz]
-            ys = [row * 2 + cur]
-            for n, new in tr:
-                x = n / s.hz
-                xs.extend([x, x])
-                ys.extend([row * 2 + cur, row * 2 + new])
-                cur = new
-            xs.append(en / s.hz)
-            ys.append(row * 2 + cur)
-            ax.plot(xs, ys, linewidth=1.0)
-            yt.append(row * 2 + 0.5)
-            labels.append(f"CH{i} ({name})")
-        ax.set_xlabel("Time (s)")
-        ax.set_yticks(yt, labels)
-        ax.set_xlim(st / s.hz, en / s.hz)
-        ax.grid(True, axis="x", alpha=0.25)
+        if a.plot_mode == "overview":
+            fig = _plot_overview(plt, s, cs, st, en, a)
+        else:
+            fig = _plot_waveform(plt, s, cs, st, en, a)
         fig.tight_layout()
         fig.savefig(a.output, dpi=a.dpi)
         plt.close(fig)
@@ -519,6 +593,23 @@ def parser():
     q.add_argument("--relative-time", action="store_true")
     q.add_argument("--min-edge-spacing-ms", type=float, default=0.0)
     q.add_argument("--rpm-sanity-max", type=float, default=0.0)
+    q.add_argument(
+        "--quality-reject-ratio",
+        type=float,
+        default=0.99,
+        help="fail quality check when rejected interval ratio reaches this value (default: 0.99)",
+    )
+    q.add_argument(
+        "--min-valid-samples",
+        type=int,
+        default=3,
+        help="minimum valid RPM samples required by quality check (default: 3)",
+    )
+    q.add_argument(
+        "--allow-low-quality",
+        action="store_true",
+        help="write/debug RPM output even when the signal quality check fails",
+    )
     q.set_defaults(fn=rpm)
 
     q = sub.add_parser("pwm")
@@ -543,7 +634,19 @@ def parser():
     q.add_argument("--start-s", type=float, default=0)
     q.add_argument("--end-s", type=float, required=True)
     q.add_argument("-o", "--output", required=True)
+    q.add_argument("--plot-mode", choices=["waveform", "overview"], default="waveform")
     q.add_argument("--max-transitions", type=int, default=200000)
+    q.add_argument(
+        "--overview-bins",
+        type=int,
+        default=1200,
+        help="number of time bins for overview transition-rate plots (default: 1200)",
+    )
+    q.add_argument(
+        "--overview-log-y",
+        action="store_true",
+        help="use symlog y-axis for overview plots with very different channel activity",
+    )
     q.add_argument("--dpi", type=int, default=150)
     q.set_defaults(fn=plot)
     return p
