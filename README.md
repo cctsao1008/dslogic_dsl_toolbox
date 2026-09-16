@@ -13,10 +13,10 @@ The implementation was developed and verified against **DSView v1.3.2 / DSL form
 - `edges` — export edge timestamps for one channel
 - `rpm` — convert selected edge timing + PPR into mechanical RPM
 - `pwm` — decode HIGH PWM pulse width, frequency, duty, and optional command mapping
-- `plot` — plot selected digital channels over a chosen time range
+- `plot` — plot raw digital waveforms or a transition-rate overview
 - `analyze_esc_response.py` — generate an ESC step-response report from throttle PWM + optical/tach RPM channels
 
-The toolbox is intentionally read-only and never modifies the source `.dsl` file.
+The toolbox never modifies the source `.dsl` file.
 
 ## Requirements
 
@@ -28,23 +28,11 @@ Most commands use only the Python standard library. Plotting and report generati
 py -m pip install matplotlib
 ```
 
-## Usage
-
-Show capture information:
+## Basic usage
 
 ```powershell
 py .\dslogic_dsl_toolbox.py info .\capture.dsl
-```
-
-Validate the capture:
-
-```powershell
 py .\dslogic_dsl_toolbox.py check .\capture.dsl
-```
-
-Show channel statistics:
-
-```powershell
 py .\dslogic_dsl_toolbox.py stats .\capture.dsl
 ```
 
@@ -70,11 +58,6 @@ The `rpm` command converts the interval between selected edges into mechanical R
 
 ```text
 RPM = 60 / (edge_interval_seconds * PPR)
-```
-
-Equivalent frequency form:
-
-```text
 RPM = 60 * edge_frequency_hz / PPR
 ```
 
@@ -82,18 +65,16 @@ RPM = 60 * edge_frequency_hz / PPR
 
 `PPR` means **selected edge events per mechanical revolution**.
 
-PPR must be derived from the number of events that the sensor actually produces per mechanical revolution for the selected edge mode. It must **not** be inferred from propeller blade count alone.
+PPR must come from the events that the sensor actually produces per mechanical revolution for the selected edge mode. It must **not** be inferred from propeller blade count alone.
 
-Examples:
-
-| Physical setup | Selected edge mode | Detected events / rev | `--ppr` |
+| Physical setup | Selected edge mode | Events / rev | `--ppr` |
 |---|---|---:|---:|
-| Two-blade propeller, reflective marker on only one blade | rising only | 1 | 1 |
-| Two-blade propeller, reflective marker on only one blade | falling only | 1 | 1 |
-| Optical sensor detects both blade passages | rising only | 2 | 2 |
-| Optical sensor detects both blade passages | falling only | 2 | 2 |
-| One detected pulse per revolution, both rising and falling edges counted | both | 2 | 2 |
-| Two detected pulses per revolution, both rising and falling edges counted | both | 4 | 4 |
+| Two-blade propeller, reflective marker on one blade only | rising | 1 | 1 |
+| Two-blade propeller, reflective marker on one blade only | falling | 1 | 1 |
+| Optical sensor detects both blade passages | rising | 2 | 2 |
+| Optical sensor detects both blade passages | falling | 2 | 2 |
+| One detected pulse/rev, both edges counted | both | 2 | 2 |
+| Two detected pulses/rev, both edges counted | both | 4 | 4 |
 
 For the current single-reflective-marker setup:
 
@@ -111,9 +92,9 @@ edge frequency ~= 146.67 Hz
 edge interval  ~= 6.82 ms
 ```
 
-If both blades are actually detected by the optical sensor with one selected edge polarity, use `PPR = 2`; at 8800 RPM the corresponding edge interval is about 3.41 ms.
+If both blades are actually detected with one selected edge polarity, use `PPR = 2`; at 8800 RPM the corresponding edge interval is about 3.41 ms.
 
-See [`docs/ppr-and-optical-rpm.md`](docs/ppr-and-optical-rpm.md) for the measurement definition and examples.
+See [`docs/ppr-and-optical-rpm.md`](docs/ppr-and-optical-rpm.md).
 
 Basic example:
 
@@ -125,7 +106,7 @@ py .\dslogic_dsl_toolbox.py rpm .\capture.dsl `
   -o .\rpm.csv
 ```
 
-Optional filtering for noisy edge captures:
+Recommended bounded example for an E61 optical-RPM capture:
 
 ```powershell
 py .\dslogic_dsl_toolbox.py rpm .\capture.dsl `
@@ -143,9 +124,54 @@ The RPM CSV contains:
 sample,time_s,dt_s,edge_frequency_hz,ppr,rpm
 ```
 
-The short-interval filter is applied to each interval between **adjacent raw selected edges**. Rejected intervals are not merged with neighboring intervals; this avoids creating false low-frequency/RPM samples from dense glitch bursts.
+The short-interval filter always evaluates the interval between **adjacent raw selected edges**. Rejected edges are not merged with neighbors, avoiding false low-RPM samples from dense glitch bursts.
 
-Decode an ESC-style PWM command on CH1, mapping 1000–1900 us to 0–90%:
+### RPM signal-quality guard
+
+Toolbox `v1.2.0` adds a guard against producing plausible-looking RPM from a channel that is incompatible with the requested edge/PPR model.
+
+The command reports:
+
+```text
+Selected edges
+Valid RPM samples
+Rejected short intervals
+Rejected sanity-limit intervals
+Rejected interval ratio
+```
+
+By default, the command fails if fewer than 3 valid RPM samples remain or if at least 99% of considered intervals are rejected.
+
+Example failure:
+
+```text
+Selected edges          : 351,724
+Valid RPM samples       : 2
+Rejected interval ratio : 99.9994%
+
+ERROR: RPM signal quality check failed ...
+```
+
+This is a strong indication that the selected channel is not compatible with the requested tach/RPM model, or that channel mapping / PPR / edge polarity is wrong.
+
+For deliberate debugging only, override with:
+
+```powershell
+--allow-low-quality
+```
+
+The thresholds are configurable:
+
+```powershell
+--quality-reject-ratio 0.99 `
+--min-valid-samples 3
+```
+
+If neither `--min-edge-spacing-ms` nor `--rpm-sanity-max` is set, the tool prints a note that no RPM plausibility limits are active.
+
+## PWM / throttle decoding
+
+Example: decode an ESC-style PWM command on CH1, mapping 1000–1900 us to 0–90%:
 
 ```powershell
 py .\dslogic_dsl_toolbox.py pwm .\capture.dsl `
@@ -159,21 +185,53 @@ py .\dslogic_dsl_toolbox.py pwm .\capture.dsl `
   -o .\throttle.csv
 ```
 
-Plot a selected time window:
+## Plotting
+
+### Raw waveform mode
+
+```powershell
+py .\dslogic_dsl_toolbox.py plot .\capture.dsl `
+  --channels CH0 CH1 `
+  --start-s 0 `
+  --end-s 6 `
+  -o .\window.png
+```
+
+Raw waveform mode protects against rendering an excessive number of transitions. The default limit is 200,000 transitions per channel.
+
+The limit may be explicitly raised:
+
+```powershell
+--max-transitions 300000
+```
+
+### Overview mode for dense signals
+
+For long windows or high-transition-rate channels, use overview mode instead of drawing every edge:
 
 ```powershell
 py .\dslogic_dsl_toolbox.py plot .\capture.dsl `
   --channels CH0 CH1 `
   --start-s 12.5 `
   --end-s 18.5 `
-  -o .\window.png
+  --plot-mode overview `
+  --overview-bins 800 `
+  -o .\overview.png
+```
+
+Overview mode bins the capture and plots **transition rate (edges/s)** per channel. This makes dense switching/activity envelopes visible without rendering hundreds of thousands of vertical edges.
+
+For channels with very different transition rates:
+
+```powershell
+--overview-log-y
 ```
 
 ## ESC step-response report
 
-`analyze_esc_response.py` is the higher-level report generator. It keeps channel mapping explicit rather than guessing signal roles.
+`analyze_esc_response.py` is the higher-level report generator. Channel mapping is explicit rather than guessed.
 
-For a capture with throttle PWM on CH1 and one-marker optical RPM on CH0:
+Example for throttle PWM on CH1 and one-marker optical RPM on CH0:
 
 ```powershell
 py .\analyze_esc_response.py .\capture.dsl `
@@ -184,18 +242,25 @@ py .\analyze_esc_response.py .\capture.dsl `
   --pwm-low-us 1000 `
   --pwm-high-us 1900 `
   --throttle-max-pct 90 `
+  --min-edge-spacing-ms 6 `
+  --rpm-sanity-max 10500 `
   --target-rpm 8800 `
   --step-direction rise `
   -o .\capture_response_report.png
 ```
 
-Channel names stored in the DSL session may be used instead of numeric channel IDs, for example:
+Channel names stored in the DSL session may be used instead of numeric IDs:
 
 ```powershell
 --throttle-channel THROTTLE --rpm-channel RPM
 ```
 
-For captures containing multiple throttle transitions, use `--step-direction rise|fall|any` and `--step-index N` to select the response to analyze.
+For captures containing multiple throttle transitions, use:
+
+```text
+--step-direction rise|fall|any
+--step-index N
+```
 
 The report contains:
 
@@ -204,7 +269,7 @@ The report contains:
 - RPM response and throttle command on a common time axis
 - T0 and target-crossing markers
 
-It also writes sidecar data using the report filename stem:
+It also writes:
 
 ```text
 *_rpm.csv
@@ -212,7 +277,17 @@ It also writes sidecar data using the report filename stem:
 *_metrics.json
 ```
 
-The report generator uses the same PPR convention as the toolbox: **PPR is selected edge events per mechanical revolution**.
+### Report RPM quality guard
+
+`analyze_esc_response.py v1.1.0` applies the same RPM-signal quality principle before generating a performance report. A suspect channel is rejected before a misleading report is written.
+
+Debug override:
+
+```powershell
+--allow-low-quality-rpm
+```
+
+The metrics JSON records the RPM quality statistics used by the report.
 
 ## Supported DSL layout
 
@@ -226,9 +301,7 @@ Current parser support is deliberately conservative:
 
 RLE-compressed captures are detected and rejected instead of being silently mis-decoded.
 
-## Design principle
-
-This repository is intended to keep raw measurement extraction separate from application-level interpretation.
+## Architecture
 
 ```text
 DSLogic .dsl
@@ -236,14 +309,16 @@ DSLogic .dsl
     v
 dslogic_dsl_toolbox.py
     |-- edges
-    |-- RPM / PPR scaling
+    |-- RPM / PPR scaling + quality guard
     |-- PWM
     |-- transition CSV
     |-- waveform plot
+    `-- transition-rate overview
     |
     v
 analyze_esc_response.py
     |-- explicit throttle / RPM channel mapping
+    |-- RPM signal-quality guard
     |-- throttle step selection
     |-- response milestones
     |-- rise / settling / overshoot metrics
@@ -260,8 +335,8 @@ Keeping raw-capture parsing separate from domain-specific analysis makes the too
 
 ## Status
 
-Toolbox version: `v1.1.0`
+Toolbox version: `v1.2.0`
 
-ESC response report generator: `v1.0.0`
+ESC response report generator: `v1.1.0`
 
 Known limitation: DSView RLE-compressed `.dsl` captures are not yet supported.
