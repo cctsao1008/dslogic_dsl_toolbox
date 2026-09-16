@@ -77,7 +77,42 @@ Equivalent frequency form:
 RPM = 60 * edge_frequency_hz / PPR
 ```
 
-`PPR` means **selected edge events per mechanical revolution**. For example, if a tachometer produces one pulse per revolution and only falling edges are selected, use `--ppr 1`. If both rising and falling edges are selected for that same pulse train, use `--ppr 2`.
+### Canonical PPR definition
+
+`PPR` means **selected edge events per mechanical revolution**.
+
+PPR must be derived from the number of events that the sensor actually produces per mechanical revolution for the selected edge mode. It must **not** be inferred from propeller blade count alone.
+
+Examples:
+
+| Physical setup | Selected edge mode | Detected events / rev | `--ppr` |
+|---|---|---:|---:|
+| Two-blade propeller, reflective marker on only one blade | rising only | 1 | 1 |
+| Two-blade propeller, reflective marker on only one blade | falling only | 1 | 1 |
+| Optical sensor detects both blade passages | rising only | 2 | 2 |
+| Optical sensor detects both blade passages | falling only | 2 | 2 |
+| One detected pulse per revolution, both rising and falling edges counted | both | 2 | 2 |
+| Two detected pulses per revolution, both rising and falling edges counted | both | 4 | 4 |
+
+For the current single-reflective-marker setup:
+
+```text
+Propeller          : two-blade
+Reflective markers : one marker on one blade
+Selected edge      : rising OR falling
+PPR                : 1
+```
+
+At 8800 RPM:
+
+```text
+edge frequency ~= 146.67 Hz
+edge interval  ~= 6.82 ms
+```
+
+If both blades are actually detected by the optical sensor with one selected edge polarity, use `PPR = 2`; at 8800 RPM the corresponding edge interval is about 3.41 ms.
+
+See [`docs/ppr-and-optical-rpm.md`](docs/ppr-and-optical-rpm.md) for the measurement definition and examples.
 
 Basic example:
 
