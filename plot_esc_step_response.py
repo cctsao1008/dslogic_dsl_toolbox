@@ -9,6 +9,9 @@ Measurement contract:
 The two timing markers are independently configurable:
   --throttle-t auto|manual|none
   --rpm-t      auto|manual|none
+
+The PWM command axis is independently configurable:
+  --pwm-axis us|percent
 """
 
 import argparse
@@ -18,7 +21,7 @@ from pathlib import Path
 
 from dslogic_dsl_toolbox import DSL, DSLError, pulse_iter, span
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 RPM_CH = "CH0"
 COMMAND_CH = "CH1"
 
@@ -243,11 +246,23 @@ def choose_rpm_t(s, rows, throttle_t, a):
     )
 
 
-def build_pwm_plot_rows(pwm_rows, start_s, end_s, origin):
+def pwm_percent(width_us, a):
+    if a.pwm_high_us == a.pwm_low_us:
+        raise DSLError("--pwm-high-us and --pwm-low-us must differ")
+    return (width_us - a.pwm_low_us) * a.pwm_max_pct / (a.pwm_high_us - a.pwm_low_us)
+
+
+def pwm_display_value(width_us, a):
+    if a.pwm_axis == "us":
+        return width_us
+    return pwm_percent(width_us, a)
+
+
+def build_pwm_plot_rows(pwm_rows, start_s, end_s, origin, a):
     q = [(t, w) for t, w in pwm_rows if start_s <= t <= end_s]
     if not q:
         return [], []
-    return [t - origin for t, _ in q], [w for _, w in q]
+    return [t - origin for t, _ in q], [pwm_display_value(w, a) for _, w in q]
 
 
 def plot(s, capture_name, rpm_rows, pwm_rows, throttle_t, rpm_t, step, a):
@@ -271,7 +286,7 @@ def plot(s, capture_name, rpm_rows, pwm_rows, throttle_t, rpm_t, step, a):
     if not r:
         raise DSLError("No RPM samples in selected plot window")
 
-    px, py = build_pwm_plot_rows(pwm_rows, plot_start, plot_end, origin)
+    px, py = build_pwm_plot_rows(pwm_rows, plot_start, plot_end, origin, a)
 
     fig, ax1 = plt.subplots(figsize=(12, 6), dpi=a.dpi)
     ax1.plot([x for x, _ in r], [y for _, y in r], linewidth=2.2)
@@ -308,12 +323,20 @@ def plot(s, capture_name, rpm_rows, pwm_rows, throttle_t, rpm_t, step, a):
     ax2 = ax1.twinx()
     if px:
         ax2.step(px, py, where="post", linestyle="--", linewidth=1.8, alpha=0.8)
-    ax2.set_ylabel("PWM Ton (us)")
+
+    if a.pwm_axis == "us":
+        pwm_axis_label = "PWM Ton (us)"
+        pwm_subtitle = "PWM Ton"
+    else:
+        pwm_axis_label = "PWM command (%)"
+        pwm_subtitle = "PWM command (%)"
+        ax2.set_ylim(0, max(100.0, a.pwm_max_pct))
+    ax2.set_ylabel(pwm_axis_label)
 
     title = a.title or f"{Path(capture_name).stem} Step Response"
     fig.suptitle(title, fontsize=18, y=0.97)
 
-    subtitle = "RPM — dashed grey line is PWM Ton"
+    subtitle = f"RPM — dashed grey line is {pwm_subtitle}"
     if rpm_t is not None:
         if elapsed is not None:
             subtitle += f" | Time to {a.target_rpm:.0f} RPM = {elapsed:.3f} s"
@@ -322,7 +345,15 @@ def plot(s, capture_name, rpm_rows, pwm_rows, throttle_t, rpm_t, step, a):
     ax1.set_title(subtitle, fontsize=13, pad=10)
 
     if step is not None:
-        print(f"Throttle step: {step['before_us']:.1f} -> {step['after_us']:.1f} us @ {throttle_t:.6f} s")
+        if a.pwm_axis == "percent":
+            before_pct = pwm_percent(step["before_us"], a)
+            after_pct = pwm_percent(step["after_us"], a)
+            print(
+                f"Throttle step: {step['before_us']:.1f} -> {step['after_us']:.1f} us "
+                f"({before_pct:.2f}% -> {after_pct:.2f}%) @ {throttle_t:.6f} s"
+            )
+        else:
+            print(f"Throttle step: {step['before_us']:.1f} -> {step['after_us']:.1f} us @ {throttle_t:.6f} s")
     elif throttle_t is not None:
         print(f"Throttle T (manual): {throttle_t:.6f} s")
     else:
@@ -374,6 +405,17 @@ def parser():
 
     p.add_argument("--pwm-min-us", type=float, default=500.0)
     p.add_argument("--pwm-max-us", type=float, default=2500.0)
+    p.add_argument(
+        "--pwm-axis",
+        "--command-axis",
+        dest="pwm_axis",
+        choices=["us", "percent"],
+        default="us",
+        help="right-axis display units: raw PWM Ton in microseconds or mapped command percent",
+    )
+    p.add_argument("--pwm-low-us", type=float, default=1000.0, help="PWM width corresponding to 0%% in percent mode")
+    p.add_argument("--pwm-high-us", type=float, default=1900.0, help="PWM width corresponding to --pwm-max-pct in percent mode")
+    p.add_argument("--pwm-max-pct", "--throttle-max-pct", dest="pwm_max_pct", type=float, default=90.0)
     p.add_argument("--segment-tolerance-us", type=float, default=5.0)
     p.add_argument("--segment-min-pulses", type=int, default=3)
 
@@ -403,6 +445,8 @@ def parser():
 def main():
     a = parser().parse_args()
     try:
+        if a.pwm_axis == "percent" and a.pwm_high_us == a.pwm_low_us:
+            raise DSLError("--pwm-high-us and --pwm-low-us must differ in percent mode")
         with DSL(a.dsl) as s:
             _cmd, pulses, pwm_rows = decode_pwm(s, a)
             throttle_t, step, _segments = choose_throttle_t(s, pulses, a)
