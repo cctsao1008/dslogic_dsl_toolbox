@@ -14,6 +14,7 @@ The implementation was developed and verified against **DSView v1.3.2 / DSL form
 - `rpm` — convert selected edge timing + PPR into mechanical RPM
 - `pwm` — decode HIGH PWM pulse width, frequency, duty, and optional command mapping
 - `plot` — plot selected digital channels over a chosen time range
+- `analyze_esc_response.py` — generate an ESC step-response report from throttle PWM + optical/tach RPM channels
 
 The toolbox is intentionally read-only and never modifies the source `.dsl` file.
 
@@ -21,7 +22,7 @@ The toolbox is intentionally read-only and never modifies the source `.dsl` file
 
 Python 3.9+ is recommended.
 
-Most commands use only the Python standard library. Plotting additionally requires Matplotlib:
+Most commands use only the Python standard library. Plotting and report generation additionally require Matplotlib:
 
 ```powershell
 py -m pip install matplotlib
@@ -168,6 +169,51 @@ py .\dslogic_dsl_toolbox.py plot .\capture.dsl `
   -o .\window.png
 ```
 
+## ESC step-response report
+
+`analyze_esc_response.py` is the higher-level report generator. It keeps channel mapping explicit rather than guessing signal roles.
+
+For a capture with throttle PWM on CH1 and one-marker optical RPM on CH0:
+
+```powershell
+py .\analyze_esc_response.py .\capture.dsl `
+  --throttle-channel CH1 `
+  --rpm-channel CH0 `
+  --rpm-edge falling `
+  --ppr 1 `
+  --pwm-low-us 1000 `
+  --pwm-high-us 1900 `
+  --throttle-max-pct 90 `
+  --target-rpm 8800 `
+  --step-direction rise `
+  -o .\capture_response_report.png
+```
+
+Channel names stored in the DSL session may be used instead of numeric channel IDs, for example:
+
+```powershell
+--throttle-channel THROTTLE --rpm-channel RPM
+```
+
+For captures containing multiple throttle transitions, use `--step-direction rise|fall|any` and `--step-index N` to select the response to analyze.
+
+The report contains:
+
+- response milestone table: first response, 10%, 63.2% (tau), 90%, 95%, settled
+- KPI cards: 10–90% rise time, time to target RPM, steady-state RPM, overshoot
+- RPM response and throttle command on a common time axis
+- T0 and target-crossing markers
+
+It also writes sidecar data using the report filename stem:
+
+```text
+*_rpm.csv
+*_throttle_segments.csv
+*_metrics.json
+```
+
+The report generator uses the same PPR convention as the toolbox: **PPR is selected edge events per mechanical revolution**.
+
 ## Supported DSL layout
 
 Current parser support is deliberately conservative:
@@ -182,7 +228,7 @@ RLE-compressed captures are detected and rejected instead of being silently mis-
 
 ## Design principle
 
-This repository is intended to be the **measurement extraction layer**, not an application-specific ESC analyzer.
+This repository is intended to keep raw measurement extraction separate from application-level interpretation.
 
 ```text
 DSLogic .dsl
@@ -196,8 +242,15 @@ dslogic_dsl_toolbox.py
     |-- waveform plot
     |
     v
-Higher-level analyzers
-    |-- ESC step response
+analyze_esc_response.py
+    |-- explicit throttle / RPM channel mapping
+    |-- throttle step selection
+    |-- response milestones
+    |-- rise / settling / overshoot metrics
+    `-- report PNG + CSV / JSON sidecars
+    |
+    v
+Other higher-level analyzers
     |-- ESC doublet response
     |-- BEMF / gate timing analysis
     `-- other project-specific analysis
@@ -207,6 +260,8 @@ Keeping raw-capture parsing separate from domain-specific analysis makes the too
 
 ## Status
 
-Current version: `v1.1.0`
+Toolbox version: `v1.1.0`
+
+ESC response report generator: `v1.0.0`
 
 Known limitation: DSView RLE-compressed `.dsl` captures are not yet supported.
