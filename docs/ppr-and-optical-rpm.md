@@ -2,19 +2,15 @@
 
 ## Purpose
 
-This note defines the canonical interpretation of PPR for optical RPM measurements used with `dslogic_dsl_toolbox.py`.
-
-The key rule is:
+This note defines the canonical interpretation of PPR for optical / tachometer RPM measurements used by this repository.
 
 > **PPR is the number of selected edge events detected per mechanical revolution.**
 
-PPR is determined by the actual sensor / marker configuration and the selected edge polarity. It is not determined by blade count alone.
-
----
+PPR is determined by the actual sensor / marker configuration and the selected edge polarity. It is **not** determined by blade count alone.
 
 ## RPM equations
 
-For selected edge frequency `f_edge` in Hz:
+For selected-edge frequency `f_edge` in Hz:
 
 ```text
 RPM = 60 * f_edge / PPR
@@ -28,11 +24,9 @@ RPM = 60 / (dt * PPR)
 
 Use one edge mode consistently during a measurement:
 
-- rising only,
-- falling only, or
+- rising only;
+- falling only; or
 - both, with PPR adjusted accordingly.
-
----
 
 ## Configuration A — single reflective marker
 
@@ -54,16 +48,6 @@ Selected edges / revolution  : 1
 PPR                          : 1
 ```
 
-Recommended command:
-
-```powershell
-py .\dslogic_dsl_toolbox.py rpm .\capture.dsl `
-  --channel CH0 `
-  --edge falling `
-  --ppr 1 `
-  -o .\rpm.csv
-```
-
 Reference values:
 
 | RPM | Selected-edge frequency | Selected-edge interval |
@@ -74,8 +58,6 @@ Reference values:
 | 8,800 | 146.67 Hz | 6.82 ms |
 
 For the current single-reflective-marker measurement setup, this is the canonical configuration.
-
----
 
 ## Configuration B — both blade passages are detected
 
@@ -96,16 +78,6 @@ Selected edges / revolution  : 2
 PPR                          : 2
 ```
 
-Recommended command:
-
-```powershell
-py .\dslogic_dsl_toolbox.py rpm .\capture.dsl `
-  --channel CH0 `
-  --edge rising `
-  --ppr 2 `
-  -o .\rpm.csv
-```
-
 Reference values:
 
 | RPM | Selected-edge frequency | Selected-edge interval |
@@ -115,11 +87,9 @@ Reference values:
 | 6,000 | 200.00 Hz | 5.00 ms |
 | 8,800 | 293.33 Hz | 3.41 ms |
 
----
-
 ## Edge-mode effect on PPR
 
-If a pulse train generates one HIGH pulse for every detected event:
+If one detected event produces one HIGH pulse:
 
 ```text
          rising              falling
@@ -130,11 +100,9 @@ ___________|-------------------|___________
 
 Then:
 
-- `--edge rising` counts one edge per detected pulse,
-- `--edge falling` counts one edge per detected pulse,
-- `--edge both` counts two edges per detected pulse.
-
-Examples:
+- `rising` counts one edge per detected pulse;
+- `falling` counts one edge per detected pulse;
+- `both` counts two edges per detected pulse.
 
 | Detected pulses / rev | Edge mode | PPR |
 |---:|---|---:|
@@ -145,53 +113,51 @@ Examples:
 | 2 | falling | 2 |
 | 2 | both | 4 |
 
-Therefore, changing edge mode without changing PPR can produce a 2x RPM error.
+Changing edge mode without changing PPR can therefore create a 2x RPM error.
 
----
+## Generic toolbox usage
 
-## Step-response measurement contract
+The low-level toolbox allows explicit channel selection:
 
-For PWM + optical-RPM step-response measurements, both signals should be captured on the same logic-analyzer time base.
-
-Recommended channel assignment:
-
-```text
-CH0 : optical RPM pulse
-CH1 : throttle PWM command
+```powershell
+py .\dslogic_dsl_toolbox.py rpm .\capture.dsl `
+  --channel CH0 `
+  --edge falling `
+  --ppr 1 `
+  -o .\rpm.csv
 ```
 
-Channel numbers are not intrinsic requirements; tools should allow explicit channel selection.
+This generic command is intentionally reusable beyond the fixed ESC measurement wiring.
 
-Example:
+## ESC step-response measurement contract
+
+`plot_esc_step_response.py` uses a fixed measurement contract:
 
 ```text
---rpm-channel CH0
---throttle-channel CH1
+CH0 = Tachometer PULSE output
+CH1 = ESC PWM command input
+CH2 = unused
+CH3 = unused
 ```
 
-The physical setup determines PPR independently:
+Both CH0 and CH1 are captured on the same logic-analyzer time base.
+
+For a PWM step:
 
 ```text
-Single reflective marker -> PPR = 1 for one selected edge polarity
-Both blade passages       -> PPR = 2 for one selected edge polarity
+T0 = selected throttle-command transition
 ```
 
-For a 1000 us -> 1900 us throttle step:
+For a target such as 8800 RPM:
 
 ```text
-T0 = first 1900 us PWM command frame
-```
-
-For a target RPM such as 8800 RPM:
-
-```text
-Ttarget = first valid RPM sample reaching the target according to the analyzer's acceptance criteria
+Ttarget = first valid sustained target-RPM crossing
 Response time = Ttarget - T0
 ```
 
-Higher-level analyzers may add blanking, persistence, floor, sanity, or settling criteria. Those are analysis-policy parameters and are intentionally separate from the raw PPR conversion.
+Pulse-width qualification, RPM plausibility limits, target persistence, and plot smoothing are analysis-policy parameters. They are intentionally separate from the PPR definition itself.
 
----
+See [ESC Step-Response Workflow](step-response.md) for the current measurement pipeline.
 
 ## Sanity checks before formal analysis
 
@@ -199,13 +165,11 @@ Before relying on calculated RPM:
 
 1. Verify the actual marker / sensor configuration.
 2. Verify how many valid pulses are produced per mechanical revolution.
-3. Select a single edge polarity unless there is a deliberate reason to use both.
+3. Select one edge polarity unless there is a deliberate reason to use both.
 4. Set PPR to the number of selected edge events per mechanical revolution.
-5. Compare calculated RPM against an independent displayed or expected RPM where possible.
-6. Check for missing, duplicated, or noisy edges.
-7. Keep throttle and RPM signals on the same capture time base for response-time analysis.
-
----
+5. Check for narrow glitches, missing pulses, or duplicated pulses.
+6. Compare calculated RPM against an independent displayed or expected RPM where possible.
+7. Keep command and tachometer signals on the same capture time base for response-time analysis.
 
 ## Summary
 
